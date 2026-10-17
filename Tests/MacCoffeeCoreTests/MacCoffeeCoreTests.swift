@@ -275,6 +275,48 @@ final class MacCoffeeCoreTests: XCTestCase {
         XCTAssertFalse(LidAwakePolicyTransitions.ownsSession(record, connectionIdentifier: "status-only-connection"))
     }
 
+    func testMenuBarPresentationSeparatesOffStateFromSavedDisplayPreference() {
+        let presentation = CoffeeMenuBarPresentation.make(for: .off, keepsScreenOn: true)
+
+        XCTAssertEqual(presentation.symbolName, "cup.and.saucer")
+        XCTAssertEqual(presentation.title, "OFF")
+        XCTAssertTrue(presentation.accessibilityLabel.contains("off"))
+        XCTAssertFalse(presentation.accessibilityLabel.localizedCaseInsensitiveContains("display"))
+        XCTAssertFalse(presentation.accessibilityLabel.localizedCaseInsensitiveContains("screen"))
+    }
+
+    func testMenuBarPresentationUsesFiniteCountdownOrUntilStoppedLabel() {
+        let finite = CoffeeMenuBarPresentation.make(
+            for: .active(remaining: 3_598.2),
+            keepsScreenOn: true
+        )
+        XCTAssertEqual(finite.symbolName, "cup.and.saucer.fill")
+        XCTAssertEqual(finite.title, "59:59")
+        XCTAssertTrue(finite.accessibilityLabel.contains("59 minutes remaining"))
+        XCTAssertTrue(finite.accessibilityLabel.contains("display is also being kept awake"))
+
+        let unlimited = CoffeeMenuBarPresentation.make(for: .active(remaining: nil), keepsScreenOn: false)
+        XCTAssertEqual(unlimited.title, "ON")
+        XCTAssertTrue(unlimited.accessibilityLabel.contains("until stopped"))
+        XCTAssertFalse(unlimited.accessibilityLabel.contains("display"))
+    }
+
+    func testMenuBarPresentationGivesTransitionsAndErrorsDistinctShapesAndText() {
+        let starting = CoffeeMenuBarPresentation.make(for: .starting, keepsScreenOn: false)
+        XCTAssertEqual(starting.symbolName, "hourglass")
+        XCTAssertEqual(starting.title, "Starting")
+
+        let stopping = CoffeeMenuBarPresentation.make(for: .stopping, keepsScreenOn: false)
+        XCTAssertEqual(stopping.symbolName, "arrow.uturn.backward.circle")
+        XCTAssertEqual(stopping.title, "Stopping")
+
+        let error = CoffeeMenuBarPresentation.make(for: .error("Helper approval is required."), keepsScreenOn: true)
+        XCTAssertEqual(error.symbolName, "exclamationmark.triangle.fill")
+        XCTAssertEqual(error.title, "Fix")
+        XCTAssertTrue(error.accessibilityLabel.contains("Helper approval is required."))
+        XCTAssertFalse(error.symbolName == CoffeeMenuBarPresentation.make(for: .active(remaining: 10), keepsScreenOn: false).symbolName)
+    }
+
     private func makeRecord(duration: TimeInterval?) -> LidAwakeSessionRecord {
         LidAwakeSessionRecord(
             durationSeconds: duration,
