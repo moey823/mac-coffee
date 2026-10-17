@@ -11,14 +11,6 @@ final class MacCoffeeAppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var cancellables = Set<AnyCancellable>()
 
-    private static var statusItemWidth: CGFloat {
-        let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
-        let labels = ["120:00", "Starting", "Stopping"]
-        let titleWidth = labels.map { ($0 as NSString).size(withAttributes: [.font: font]).width }.max() ?? 44
-        // Reserve the widest two-hour countdown and transition labels so the next menu item never shifts.
-        return ceil(titleWidth + 16 + 6 + 20)
-    }
-
     init(showPopoverOnLaunch: Bool = false) {
         self.showPopoverOnLaunch = showPopoverOnLaunch
         super.init()
@@ -26,10 +18,12 @@ final class MacCoffeeAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        let item = NSStatusBar.system.statusItem(withLength: Self.statusItemWidth)
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem = item
         if let button = item.button {
-            button.imagePosition = .imageLeading
+            button.imagePosition = .imageOnly
+            button.title = ""
+            button.attributedTitle = NSAttributedString(string: "")
             button.target = self
             button.action = #selector(togglePopover(_:))
         }
@@ -73,19 +67,84 @@ final class MacCoffeeAppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusItem(_ presentation: CoffeeMenuBarPresentation) {
         guard let button = statusItem?.button else { return }
-        let configuration = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
-        let image = NSImage(
-            systemSymbolName: presentation.symbolName,
-            accessibilityDescription: presentation.accessibilityLabel
-        )?.withSymbolConfiguration(configuration)
-        image?.isTemplate = true
+        let tint: NSColor
+        switch presentation.tint {
+        case .red: tint = .systemRed
+        case .green: tint = .systemGreen
+        case .amber: tint = .systemOrange
+        }
+
+        let image = coloredStatusImage(presentation, tint: tint)
         button.image = image
-        button.attributedTitle = NSAttributedString(
-            string: presentation.title,
-            attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)]
-        )
+        button.contentTintColor = image == nil ? tint : nil
+        button.title = ""
+        button.attributedTitle = NSAttributedString(string: "")
         button.toolTip = presentation.accessibilityLabel
-        button.setAccessibilityLabel(presentation.accessibilityLabel)
+        button.setAccessibilityLabel("Mac Coffee")
+        button.setAccessibilityValue(presentation.accessibilityLabel)
+        button.setAccessibilityHelp(presentation.accessibilityLabel)
+    }
+
+    private func coloredStatusImage(
+        _ presentation: CoffeeMenuBarPresentation,
+        tint: NSColor
+    ) -> NSImage? {
+        let pointSize: CGFloat = 18
+        let scale: CGFloat = 4
+        let pixelSize = Int(pointSize * scale)
+        guard
+            let bitmap = NSBitmapImageRep(
+                bitmapDataPlanes: nil,
+                pixelsWide: pixelSize,
+                pixelsHigh: pixelSize,
+                bitsPerSample: 8,
+                samplesPerPixel: 4,
+                hasAlpha: true,
+                isPlanar: false,
+                colorSpaceName: .deviceRGB,
+                bytesPerRow: 0,
+                bitsPerPixel: 0
+            ),
+            let graphicsContext = NSGraphicsContext(bitmapImageRep: bitmap),
+            let baseImage = NSImage(
+                systemSymbolName: presentation.symbolName,
+                accessibilityDescription: presentation.accessibilityLabel
+            )
+        else {
+            return nil
+        }
+
+        let configuration = NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
+        let symbol = baseImage.withSymbolConfiguration(configuration) ?? baseImage
+        let bounds = CGRect(x: 0, y: 0, width: pointSize, height: pointSize)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = graphicsContext
+        graphicsContext.imageInterpolation = .high
+        graphicsContext.shouldAntialias = true
+        graphicsContext.cgContext.clear(CGRect(x: 0, y: 0, width: pixelSize, height: pixelSize))
+        graphicsContext.cgContext.scaleBy(x: scale, y: scale)
+        symbol.draw(
+            in: bounds,
+            from: NSRect(origin: .zero, size: symbol.size),
+            operation: .sourceOver,
+            fraction: 1,
+            respectFlipped: false,
+            hints: nil
+        )
+        graphicsContext.cgContext.setBlendMode(.sourceIn)
+        let resolvedTint = tint.usingColorSpace(.deviceRGB) ?? tint
+        graphicsContext.cgContext.setFillColor(resolvedTint.cgColor)
+        graphicsContext.cgContext.fill(bounds)
+        graphicsContext.cgContext.setBlendMode(.normal)
+        graphicsContext.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+
+        bitmap.size = NSSize(width: pointSize, height: pointSize)
+        let image = NSImage(size: bitmap.size)
+        image.addRepresentation(bitmap)
+        image.isTemplate = false
+        image.accessibilityDescription = presentation.accessibilityLabel
+        return image
     }
 
     private func sizePopoverToContent(using hostingController: NSHostingController<MacCoffeeMenuView>) {

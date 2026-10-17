@@ -8,14 +8,20 @@ public enum CoffeeMenuBarState: Equatable {
     case error(String)
 }
 
+public enum CoffeeMenuBarTint: Equatable {
+    case red
+    case green
+    case amber
+}
+
 public struct CoffeeMenuBarPresentation: Equatable {
     public let symbolName: String
-    public let title: String
+    public let tint: CoffeeMenuBarTint
     public let accessibilityLabel: String
 
-    private init(symbolName: String, title: String, accessibilityLabel: String) {
+    private init(symbolName: String, tint: CoffeeMenuBarTint, accessibilityLabel: String) {
         self.symbolName = symbolName
-        self.title = title
+        self.tint = tint
         self.accessibilityLabel = accessibilityLabel
     }
 
@@ -24,56 +30,56 @@ public struct CoffeeMenuBarPresentation: Equatable {
         case .off:
             return Self(
                 symbolName: "cup.and.saucer",
-                title: "OFF",
+                tint: .red,
                 accessibilityLabel: "Mac Coffee is off. Your Mac can sleep normally."
             )
         case .starting:
             return Self(
                 symbolName: "hourglass",
-                title: "Starting",
+                tint: .amber,
                 accessibilityLabel: "Mac Coffee is starting the awake session."
             )
         case .active(let remaining):
-            let time = remaining.map(timerText) ?? (compact: "ON", spoken: "until stopped")
+            let time = remaining.map(spokenRemaining) ?? "until stopped"
             let displayMessage = keepsScreenOn ? " The display is also being kept awake." : ""
             return Self(
                 symbolName: "cup.and.saucer.fill",
-                title: time.compact,
-                accessibilityLabel: "Mac Coffee is on, \(time.spoken).\(displayMessage)"
+                tint: .green,
+                accessibilityLabel: "Mac Coffee is on, \(time).\(displayMessage)"
             )
         case .stopping:
             return Self(
                 symbolName: "arrow.uturn.backward.circle",
-                title: "Stopping",
+                tint: .amber,
                 accessibilityLabel: "Mac Coffee is stopping and restoring normal sleep behavior."
             )
         case .error(let detail):
             return Self(
                 symbolName: "exclamationmark.triangle.fill",
-                title: "Fix",
+                tint: .red,
                 accessibilityLabel: "Mac Coffee needs attention. \(detail)"
             )
         }
     }
 
-    private static func timerText(_ remaining: TimeInterval) -> (compact: String, spoken: String) {
-        let totalSeconds = max(0, Int(ceil(max(0, remaining))))
-        let minutes = totalSeconds / 60
-        let seconds = totalSeconds % 60
-        let compact = String(format: "%02d:%02d", minutes, seconds)
-        let spokenHours = minutes / 60
-        let spokenMinutes = minutes % 60
+    private static func spokenRemaining(_ remaining: TimeInterval) -> String {
+        let seconds = max(0, Int(ceil(max(0, remaining))))
+        let hours = seconds / 3_600
+        let minutes = (seconds % 3_600) / 60
+        let extraSeconds = seconds % 60
         var parts: [String] = []
-        if spokenHours > 0 {
-            parts.append("\(spokenHours) \(spokenHours == 1 ? "hour" : "hours")")
+        if hours > 0 {
+            parts.append("\(hours) \(hours == 1 ? "hour" : "hours")")
         }
-        if spokenMinutes > 0 {
-            parts.append("\(spokenMinutes) \(spokenMinutes == 1 ? "minute" : "minutes")")
+        if minutes > 0 {
+            parts.append("\(minutes) \(minutes == 1 ? "minute" : "minutes")")
+        }
+        if extraSeconds > 0 {
+            parts.append("\(extraSeconds) \(extraSeconds == 1 ? "second" : "seconds")")
         }
         if parts.isEmpty {
-            parts.append("less than one minute")
+            parts.append("less than one second")
         }
-        let remainingText = parts.joined(separator: " and ")
-        return (compact, "\(remainingText) remaining")
+        return "\(parts.joined(separator: " and ")) remaining"
     }
 }

@@ -275,46 +275,49 @@ final class MacCoffeeCoreTests: XCTestCase {
         XCTAssertFalse(LidAwakePolicyTransitions.ownsSession(record, connectionIdentifier: "status-only-connection"))
     }
 
-    func testMenuBarPresentationSeparatesOffStateFromSavedDisplayPreference() {
+    func testOffPresentationUsesRedOutlineWithoutClaimingSavedDisplayPreference() {
         let presentation = CoffeeMenuBarPresentation.make(for: .off, keepsScreenOn: true)
 
         XCTAssertEqual(presentation.symbolName, "cup.and.saucer")
-        XCTAssertEqual(presentation.title, "OFF")
+        XCTAssertEqual(presentation.tint, .red)
         XCTAssertTrue(presentation.accessibilityLabel.contains("off"))
         XCTAssertFalse(presentation.accessibilityLabel.localizedCaseInsensitiveContains("display"))
         XCTAssertFalse(presentation.accessibilityLabel.localizedCaseInsensitiveContains("screen"))
     }
 
-    func testMenuBarPresentationUsesFiniteCountdownOrUntilStoppedLabel() {
+    func testActivePresentationUsesGreenFilledCupAndAccessibleCountdown() {
         let finite = CoffeeMenuBarPresentation.make(
             for: .active(remaining: 3_598.2),
             keepsScreenOn: true
         )
         XCTAssertEqual(finite.symbolName, "cup.and.saucer.fill")
-        XCTAssertEqual(finite.title, "59:59")
-        XCTAssertTrue(finite.accessibilityLabel.contains("59 minutes remaining"))
+        XCTAssertEqual(finite.tint, .green)
+        XCTAssertTrue(finite.accessibilityLabel.contains("59 minutes and 59 seconds remaining"))
         XCTAssertTrue(finite.accessibilityLabel.contains("display is also being kept awake"))
 
         let unlimited = CoffeeMenuBarPresentation.make(for: .active(remaining: nil), keepsScreenOn: false)
-        XCTAssertEqual(unlimited.title, "ON")
+        XCTAssertEqual(unlimited.symbolName, "cup.and.saucer.fill")
+        XCTAssertEqual(unlimited.tint, .green)
         XCTAssertTrue(unlimited.accessibilityLabel.contains("until stopped"))
         XCTAssertFalse(unlimited.accessibilityLabel.contains("display"))
     }
 
-    func testMenuBarPresentationGivesTransitionsAndErrorsDistinctShapesAndText() {
+    func testTransitionsUseAmberDistinctShapesAndErrorsUseRedWarning() {
         let starting = CoffeeMenuBarPresentation.make(for: .starting, keepsScreenOn: false)
         XCTAssertEqual(starting.symbolName, "hourglass")
-        XCTAssertEqual(starting.title, "Starting")
+        XCTAssertEqual(starting.tint, .amber)
+        XCTAssertTrue(starting.accessibilityLabel.contains("starting"))
 
         let stopping = CoffeeMenuBarPresentation.make(for: .stopping, keepsScreenOn: false)
         XCTAssertEqual(stopping.symbolName, "arrow.uturn.backward.circle")
-        XCTAssertEqual(stopping.title, "Stopping")
+        XCTAssertEqual(stopping.tint, .amber)
+        XCTAssertTrue(stopping.accessibilityLabel.contains("restoring"))
 
         let error = CoffeeMenuBarPresentation.make(for: .error("Helper approval is required."), keepsScreenOn: true)
         XCTAssertEqual(error.symbolName, "exclamationmark.triangle.fill")
-        XCTAssertEqual(error.title, "Fix")
+        XCTAssertEqual(error.tint, .red)
         XCTAssertTrue(error.accessibilityLabel.contains("Helper approval is required."))
-        XCTAssertFalse(error.symbolName == CoffeeMenuBarPresentation.make(for: .active(remaining: 10), keepsScreenOn: false).symbolName)
+        XCTAssertFalse(error.symbolName == starting.symbolName)
     }
 
     private func makeRecord(duration: TimeInterval?) -> LidAwakeSessionRecord {
