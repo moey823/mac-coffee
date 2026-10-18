@@ -218,7 +218,23 @@ struct MacCoffeeMenuView: View {
                     .labelsHidden().toggleStyle(.switch).controlSize(.small)
                     .accessibilityLabel("Keep screen on")
                     .help("Keep the display awake only during an active session.")
-                    .disabled(state.isBusy)
+                    .disabled(state.isBusy || state.isDisplaySleepActionInProgress)
+            }
+            Button {
+                Task { _ = await state.keepAwakeScreenOffNow() }
+            } label: {
+                Label("Keep awake, screen off now", systemImage: "moon.zzz")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+            .help("Start or continue the selected awake session, then turn off only the display.")
+            .disabled(state.isBusy
+                      || state.isDisplaySleepActionInProgress
+                      || (!state.isEnabled && state.isCustomTimerSelected && state.customTimerInputError != nil))
+            if let error = state.displaySleepError {
+                Text(error).font(.caption).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel("Display sleep error: \(error)")
             }
             Divider()
             HStack {

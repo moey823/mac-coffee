@@ -54,6 +54,13 @@ final class MacCoffeeCoreTests: XCTestCase {
         )
     }
 
+    func testDisplaySleepCommandTargetsOnlyTheDisplayWithFixedArguments() {
+        XCTAssertEqual(DisplaySleepCommand.executablePath, "/usr/bin/pmset")
+        XCTAssertEqual(DisplaySleepCommand.arguments, ["displaysleepnow"])
+        XCTAssertFalse(DisplaySleepCommand.arguments.contains("sleepnow"))
+        XCTAssertFalse(DisplaySleepCommand.arguments.contains("disablesleep"))
+    }
+
     func testLidAwakeDurationAndOwnershipGuards() {
         XCTAssertFalse(LidAwakeSessionPolicy.accepts(duration: 59))
         XCTAssertTrue(LidAwakeSessionPolicy.accepts(duration: 60))

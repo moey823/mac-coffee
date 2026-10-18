@@ -42,6 +42,8 @@ final class CoffeeState: ObservableObject {
     @Published private(set) var isCustomTimerSelected: Bool
     @Published private(set) var customTimerMinutesText: String
     @Published private(set) var customTimerInputError: String?
+    @Published private(set) var isDisplaySleepActionInProgress = false
+    @Published private(set) var displaySleepError: String?
     @Published var keepsScreenOn: Bool {
         didSet {
             guard keepsScreenOn != oldValue else { return }
@@ -61,6 +63,9 @@ final class CoffeeState: ObservableObject {
     private let defaults: UserDefaults
     private var caffeinateProcess: Process?
     private var wakeScreenProcess: Process?
+    private var displaySleepProcess: Process?
+    private var displaySleepRequestID: UUID?
+    private var displaySleepContinuation: CheckedContinuation<String?, Never>?
     private var sessionTask: Task<Void, Never>?
     private var operationID: UUID?
     private var sessionStartsTimerOnLidClose = false
@@ -101,19 +106,63 @@ final class CoffeeState: ObservableObject {
     func setEnabled(_ enabled: Bool) {
         guard !isPreview, !isBusy, enabled != isEnabled else { return }
         if enabled {
+            guard !isDisplaySleepActionInProgress else { return }
             if isCustomTimerSelected, customTimerInputError != nil {
                 sessionStatus = .error(customTimerInputError ?? "Enter a valid timer from 1 to 1,440 minutes.")
                 return
             }
-            Task { await beginSession() }
+            Task { _ = await beginSession() }
         } else {
             Task { await endSession() }
         }
     }
 
     func setKeepsScreenOn(_ enabled: Bool) {
-        guard keepsScreenOn != enabled else { return }
+        guard keepsScreenOn != enabled, !isDisplaySleepActionInProgress else { return }
         keepsScreenOn = enabled
+    }
+
+    /// Starts or preserves the selected awake session, removes its display
+    /// assertion, then requests sleep for the display only.
+    @discardableResult
+    func keepAwakeScreenOffNow() async -> Bool {
+        guard !isPreview, !isBusy, !isDisplaySleepActionInProgress else { return false }
+        if !isEnabled, isCustomTimerSelected, customTimerInputError != nil {
+            sessionStatus = .error(customTimerInputError ?? "Enter a valid timer from 1 to 1,440 minutes.")
+            return false
+        }
+
+        isDisplaySleepActionInProgress = true
+        displaySleepError = nil
+        defer { isDisplaySleepActionInProgress = false }
+        stopOwnedWakeScreenPulse()
+
+        if isEnabled {
+            guard hasConfirmedAwakeSession else { return false }
+            if keepsScreenOn { keepsScreenOn = false }
+        } else {
+            guard await beginSession(wakeScreenOnExplicitStart: false, keepsScreenOnOverride: false) else {
+                return false
+            }
+        }
+
+        guard hasConfirmedAwakeSession,
+              deadline.map({ $0 > Date() }) ?? true else {
+            return false
+        }
+
+        let error = await requestDisplaySleep()
+        guard hasConfirmedAwakeSession else { return false }
+        displaySleepError = error
+        return error == nil
+    }
+
+    private var hasConfirmedAwakeSession: Bool {
+        guard isEnabled, case .active = sessionStatus, caffeinateProcess?.isRunning == true else { return false }
+        if lidStateAvailable {
+            guard case .active = lidAwakeController.status else { return false }
+        }
+        return true
     }
 
     func selectTimerPreset(_ duration: LidAwakeDuration) {
@@ -178,14 +227,20 @@ final class CoffeeState: ObservableObject {
         sessionTask?.cancel()
         sessionTask = nil
         isEnabled = false
+        cancelDisplaySleepRequest()
+        displaySleepError = nil
         stopOwnedCaffeinate()
         stopOwnedWakeScreenPulse()
         if !isPreview { lidAwakeController.stopForApplicationShutdown() }
     }
 
-    private func beginSession() async {
-        guard !isPreview, !isBusy, !isEnabled else { return }
+    private func beginSession(
+        wakeScreenOnExplicitStart: Bool = true,
+        keepsScreenOnOverride: Bool? = nil
+    ) async -> Bool {
+        guard !isPreview, !isBusy, !isEnabled else { return false }
         isBusy = true
+        displaySleepError = nil
         sessionStatus = .starting
         let requestedID = UUID()
         operationID = requestedID
@@ -203,33 +258,33 @@ final class CoffeeState: ObservableObject {
         if sessionStopsOnBattery, lastPowerSource == .battery {
             sessionStatus = .error("Mac Coffee is set to stop on battery. Connect power before starting an awake session.")
             clearSessionOptions()
-            return
+            return false
         }
 
         var helperStarted = false
         if lidStateAvailable {
             await lidAwakeController.refreshStatusAndWait()
-            guard operationID == requestedID else { return }
+            guard operationID == requestedID else { return false }
             guard lidAwakeController.setupStatus == .enabled else {
                 let detail = lidAwakeController.setupStatus.detail
                 sessionStatus = .error("Set up lid-closed sleep support first: \(detail)")
                 clearSessionOptions()
-                return
+                return false
             }
             guard case .off = lidAwakeController.status else {
                 let detail = lidAwakeController.status.detail
                 sessionStatus = .error("The lid-awake helper is not ready: \(detail)")
                 clearSessionOptions()
-                return
+                return false
             }
             guard await lidAwakeController.startAndWait(
                 startOnLidClose: sessionStartsTimerOnLidClose,
                 stopOnBattery: sessionStopsOnBattery
             ) else {
-                guard operationID == requestedID else { return }
+                guard operationID == requestedID else { return false }
                 sessionStatus = .error("Could not start the lid-awake helper. Check its setup status and try again.")
                 clearSessionOptions()
-                return
+                return false
             }
             helperStarted = true
             if sessionStartsTimerOnLidClose {
@@ -245,27 +300,35 @@ final class CoffeeState: ObservableObject {
         guard operationID == requestedID else {
             if helperStarted { _ = await lidAwakeController.stopAndWait() }
             clearSessionOptions()
-            return
+            return false
         }
 
-        if let launchError = launchCaffeinate(until: deadline, wakeScreenOnExplicitStart: true) {
+        if let launchError = launchCaffeinate(
+            until: deadline,
+            wakeScreenOnExplicitStart: wakeScreenOnExplicitStart,
+            keepsDisplayOn: keepsScreenOnOverride ?? keepsScreenOn
+        ) {
             if helperStarted { _ = await lidAwakeController.stopAndWait() }
             deadline = nil
             remaining = nil
             sessionStatus = .error(launchError)
             clearSessionOptions()
-            return
+            return false
         }
 
+        if let keepsScreenOnOverride { keepsScreenOn = keepsScreenOnOverride }
         isEnabled = true
         sessionStatus = .active
         updateWaitingForLidClose()
         updateRemaining()
         startSessionMonitor()
+        return true
     }
 
     private func endSession() async {
         guard !isPreview, !isBusy else { return }
+        cancelDisplaySleepRequest()
+        displaySleepError = nil
         isBusy = true
         operationID = UUID()
         sessionTask?.cancel()
@@ -300,7 +363,8 @@ final class CoffeeState: ObservableObject {
 
     private func launchCaffeinate(
         until deadline: Date?,
-        wakeScreenOnExplicitStart: Bool
+        wakeScreenOnExplicitStart: Bool,
+        keepsDisplayOn: Bool? = nil
     ) -> String? {
         if let deadline, deadline <= Date() {
             return "The timer expired before the awake assertion could start. Choose a new timer and try again."
@@ -310,7 +374,7 @@ final class CoffeeState: ObservableObject {
         let timeout = deadline.map { AwakeDeadline.timeoutSeconds(until: $0) }
         task.arguments = CaffeinateCommand.arguments(
             ownerPID: ProcessInfo.processInfo.processIdentifier,
-            keepsDisplayOn: keepsScreenOn,
+            keepsDisplayOn: keepsDisplayOn ?? keepsScreenOn,
             timeoutSeconds: timeout,
             keepsDisksAwake: sessionKeepsDisksAwake,
             preventsSystemSleepOnAC: sessionPreventsSystemSleepOnAC
@@ -368,6 +432,71 @@ final class CoffeeState: ObservableObject {
         if let error = launchCaffeinate(until: deadline, wakeScreenOnExplicitStart: false) {
             Task { await failSession(error) }
         }
+    }
+
+    private func requestDisplaySleep() async -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: DisplaySleepCommand.executablePath)
+        process.arguments = DisplaySleepCommand.arguments
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        let requestID = UUID()
+        return await withCheckedContinuation { continuation in
+            displaySleepRequestID = requestID
+            displaySleepContinuation = continuation
+            process.terminationHandler = { [weak self] terminated in
+                let status = terminated.terminationStatus
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let error = status == 0
+                        ? nil
+                        : "The display could not be turned off (pmset exited with status \(status)). Your awake session is still on."
+                    self.finishDisplaySleepRequest(requestID, error: error)
+                }
+            }
+            do {
+                try process.run()
+                displaySleepProcess = process
+                Task { @MainActor [weak self] in
+                    do { try await Task.sleep(nanoseconds: 5_000_000_000) }
+                    catch { return }
+                    self?.finishDisplaySleepRequest(
+                        requestID,
+                        error: "The display sleep request timed out. Your awake session is still on.",
+                        terminateProcess: true
+                    )
+                }
+            } catch {
+                finishDisplaySleepRequest(
+                    requestID,
+                    error: "The display could not be turned off: \(error.localizedDescription). Your awake session is still on."
+                )
+            }
+        }
+    }
+
+    private func finishDisplaySleepRequest(
+        _ requestID: UUID,
+        error: String?,
+        terminateProcess: Bool = false
+    ) {
+        guard displaySleepRequestID == requestID else { return }
+        displaySleepRequestID = nil
+        let process = displaySleepProcess
+        displaySleepProcess = nil
+        if terminateProcess, let process, process.isRunning {
+            process.terminate()
+        }
+        let continuation = displaySleepContinuation
+        displaySleepContinuation = nil
+        continuation?.resume(returning: error)
+    }
+
+    private func cancelDisplaySleepRequest() {
+        guard let requestID = displaySleepRequestID else { return }
+        finishDisplaySleepRequest(requestID, error: nil, terminateProcess: true)
     }
 
     private func stopOwnedCaffeinate() {
@@ -483,6 +612,8 @@ final class CoffeeState: ObservableObject {
     /// the app stops caffeinate and lets the helper finish its own recovery.
     private func expireSession() async {
         guard isEnabled else { return }
+        cancelDisplaySleepRequest()
+        displaySleepError = nil
         if sessionStopsOnBattery && CoffeePowerSource.current() == .battery {
             await endSession()
             return
@@ -548,6 +679,8 @@ final class CoffeeState: ObservableObject {
 
     private func failSession(_ message: String) async {
         guard isEnabled else { return }
+        cancelDisplaySleepRequest()
+        displaySleepError = nil
         operationID = UUID()
         sessionTask?.cancel()
         sessionTask = nil
