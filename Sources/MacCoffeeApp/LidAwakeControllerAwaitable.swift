@@ -6,9 +6,13 @@ extension LidAwakeController {
         await refreshStatusAndWaitForDecision()
     }
 
-    func startAndWait(timeout: TimeInterval = 8) async -> Bool {
+    func startAndWait(
+        startOnLidClose: Bool = false,
+        stopOnBattery: Bool = false,
+        timeout: TimeInterval = 8
+    ) async -> Bool {
         guard setupStatus == .enabled else { return false }
-        start()
+        start(startOnLidClose: startOnLidClose, stopOnBattery: stopOnBattery)
         let finishBy = Date().addingTimeInterval(timeout)
         while Date() < finishBy {
             switch status {
@@ -25,8 +29,9 @@ extension LidAwakeController {
     }
 
     func stopAndWait(timeout: TimeInterval = 8) async -> Bool {
+        let expectedBatteryStop = stopOnBatteryForSession && CoffeePowerSource.current() == .battery
         stop()
-        let finishBy = Date().addingTimeInterval(timeout)
+        let finishBy = Date().addingTimeInterval(expectedBatteryStop ? max(timeout, 22) : timeout)
         while Date() < finishBy {
             switch status {
             case .off:

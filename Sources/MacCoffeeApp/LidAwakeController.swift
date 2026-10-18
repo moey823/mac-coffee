@@ -83,12 +83,14 @@ final class LidAwakeController: ObservableObject {
     @Published private(set) var remaining: TimeInterval?
     @Published private(set) var error: String?
     @Published private(set) var isRepairing = false
+    @Published private(set) var isWaitingForLidClose = false
 
     private static let durationPreferenceKey = "MacCoffee.lidAwakeDurationSeconds"
     private let isPreview: Bool
     private var isRefreshing = false
     private var ownsSession = false
     private var isStopRequestInProgress = false
+    private(set) var stopOnBatteryForSession = false
     private var operationID: UUID?
     private var sessionConnection: NSXPCConnection?
     private var heartbeatTask: Task<Void, Never>?
@@ -127,7 +129,7 @@ final class LidAwakeController: ObservableObject {
         await performStatusRefresh()
     }
 
-    func start() {
+    func start(startOnLidClose: Bool = false, stopOnBattery: Bool = false) {
         guard !isPreview, !isRepairing, !ownsSession, !isTransitioning else { return }
         guard setupStatus == .enabled else {
             status = .unavailable(setupStatus.detail)
@@ -136,9 +138,18 @@ final class LidAwakeController: ObservableObject {
         }
         let newOperationID = UUID()
         operationID = newOperationID
+        stopOnBatteryForSession = stopOnBattery
+        isWaitingForLidClose = false
         error = nil
         status = .starting
-        Task { [weak self] in await self?.performStart(operationID: newOperationID) }
+        Task {
+            [weak self] in
+            await self?.performStart(
+                operationID: newOperationID,
+                startOnLidClose: startOnLidClose,
+                stopOnBattery: stopOnBattery
+            )
+        }
     }
 
     func stop() {
@@ -148,6 +159,8 @@ final class LidAwakeController: ObservableObject {
             if let connection = sessionConnection { closeSessionConnection(connection) }
             status = .off
             error = nil
+            isWaitingForLidClose = false
+            stopOnBatteryForSession = false
             return
         }
         guard ownsSession, let connection = sessionConnection, !isStopRequestInProgress else { return }
@@ -157,6 +170,7 @@ final class LidAwakeController: ObservableObject {
         status = .stopping
         heartbeatTask?.cancel()
         heartbeatTask = nil
+        isWaitingForLidClose = false
         countdownTask?.cancel()
         countdownTask = nil
         Task { [weak self] in
@@ -173,6 +187,8 @@ final class LidAwakeController: ObservableObject {
         closeSessionConnection(connection)
         status = .off
         error = nil
+        isWaitingForLidClose = false
+        stopOnBatteryForSession = false
     }
 
     func registerHelper() {
@@ -502,7 +518,11 @@ final class LidAwakeController: ObservableObject {
         detail == "No lid-awake session is active." || detail == "System sleep is enabled."
     }
 
-    private func performStart(operationID requestedOperationID: UUID) async {
+    private func performStart(
+        operationID requestedOperationID: UUID,
+        startOnLidClose: Bool,
+        stopOnBattery: Bool
+    ) async {
         let latestSetup = currentSetupStatus()
         setupStatus = latestSetup
         guard latestSetup == .enabled else {
@@ -514,7 +534,11 @@ final class LidAwakeController: ObservableObject {
         do {
             let connection = try makeConnection(sessionConnection: true)
             sessionConnection = connection
-            let reply = try await startSession(on: connection)
+            let reply = try await startSession(
+                on: connection,
+                startOnLidClose: startOnLidClose,
+                stopOnBattery: stopOnBattery
+            )
             guard operationID == requestedOperationID, sessionConnection === connection else {
                 connection.invalidate()
                 return
@@ -530,13 +554,18 @@ final class LidAwakeController: ObservableObject {
             ownsSession = true
             isEnabled = true
             error = nil
-            deadline = reply.deadline ?? duration.seconds.map { Date().addingTimeInterval($0) }
+            let waitingForLidClose = startOnLidClose && duration.seconds != nil && reply.deadline == nil
+            isWaitingForLidClose = waitingForLidClose
+            deadline = reply.deadline
+                ?? (waitingForLidClose ? nil : duration.seconds.map { Date().addingTimeInterval($0) })
             status = .active
             updateRemaining()
             startSessionTimers(on: connection)
         } catch {
             guard operationID == requestedOperationID else { return }
             if let connection = sessionConnection { closeSessionConnection(connection) }
+            isWaitingForLidClose = false
+            stopOnBatteryForSession = false
             let message = "Could not start lid-awake: \(error.localizedDescription)"
             isEnabled = false
             deadline = nil
@@ -551,21 +580,34 @@ final class LidAwakeController: ObservableObject {
         do {
             let reply = try await stopSession(on: connection)
             guard operationID == requestedOperationID, sessionConnection === connection else { return }
-            closeSessionConnection(connection)
+            let expectedBatteryStop = stopOnBatteryForSession && CoffeePowerSource.current() == .battery
             if reply.stopped {
+                closeSessionConnection(connection)
                 error = nil
                 status = .off
             } else {
                 let message = reply.detail ?? "The helper could not confirm that normal sleep behavior was restored."
-                error = message
-                status = .error(message)
+                closeSessionConnection(connection)
+                if expectedBatteryStop, await confirmNormalSleepAfterBatteryStop() {
+                    error = nil
+                    status = .off
+                } else {
+                    error = message
+                    status = .error(message)
+                }
             }
         } catch {
             guard operationID == requestedOperationID, sessionConnection === connection else { return }
             let message = "Could not stop lid-awake cleanly: \(error.localizedDescription)"
+            let expectedBatteryStop = stopOnBatteryForSession && CoffeePowerSource.current() == .battery
             closeSessionConnection(connection)
-            self.error = message
-            status = .error(message)
+            if expectedBatteryStop, await confirmNormalSleepAfterBatteryStop() {
+                self.error = nil
+                status = .off
+            } else {
+                self.error = message
+                status = .error(message)
+            }
         }
     }
 
@@ -576,11 +618,6 @@ final class LidAwakeController: ObservableObject {
             await self.heartbeatLoop(on: connection)
         }
         countdownTask?.cancel()
-        guard deadline != nil else {
-            remaining = nil
-            countdownTask = nil
-            return
-        }
         countdownTask = Task { [weak self, weak connection] in
             guard let self, let connection else { return }
             while !Task.isCancelled {
@@ -595,8 +632,9 @@ final class LidAwakeController: ObservableObject {
 
     private func heartbeatLoop(on connection: NSXPCConnection) async {
         while !Task.isCancelled {
+            let delay: UInt64 = isWaitingForLidClose ? 1_000_000_000 : 7_000_000_000
             do {
-                try await Task.sleep(nanoseconds: 7_000_000_000)
+                try await Task.sleep(nanoseconds: delay)
             } catch { return }
             guard !Task.isCancelled, ownsSession, !isStopRequestInProgress, sessionConnection === connection else { return }
             do {
@@ -605,12 +643,17 @@ final class LidAwakeController: ObservableObject {
                 guard reply.isActive else {
                     if let deadline, deadline <= Date() {
                         stop()
+                    } else if stopOnBatteryForSession && CoffeePowerSource.current() == .battery {
+                        stop()
                     } else {
                         failSession(reply.detail ?? "The helper ended the lid-awake session.", connection: connection)
                     }
                     return
                 }
-                if let replyDeadline = reply.deadline { deadline = replyDeadline }
+                if let replyDeadline = reply.deadline {
+                    deadline = replyDeadline
+                    isWaitingForLidClose = false
+                }
                 updateRemaining()
             } catch {
                 guard ownsSession, !isStopRequestInProgress, sessionConnection === connection else { return }
@@ -668,10 +711,18 @@ final class LidAwakeController: ObservableObject {
         }
     }
 
-    private func startSession(on connection: NSXPCConnection) async throws -> LidAwakeReply {
+    private func startSession(
+        on connection: NSXPCConnection,
+        startOnLidClose: Bool,
+        stopOnBattery: Bool
+    ) async throws -> LidAwakeReply {
         let durationSeconds = duration.seconds.map { NSNumber(value: $0) }
         return try await request(operation: "start the session", on: connection) { proxy, finish in
-            proxy.startSession(durationSeconds: durationSeconds) { active, deadline, detail in
+            proxy.startSession(
+                durationSeconds: durationSeconds,
+                startOnLidClose: startOnLidClose,
+                stopOnBattery: stopOnBattery
+            ) { active, deadline, detail in
                 finish(.success(LidAwakeReply(isActive: active, deadline: deadline, detail: detail)))
             }
         }
@@ -721,9 +772,43 @@ final class LidAwakeController: ObservableObject {
 
     private func failSession(_ message: String, connection: NSXPCConnection) {
         guard sessionConnection === connection else { return }
+        let expectedBatteryStop = stopOnBatteryForSession && CoffeePowerSource.current() == .battery
         closeSessionConnection(connection)
-        error = message
-        status = .error(message)
+        isWaitingForLidClose = false
+        if expectedBatteryStop {
+            error = nil
+            status = .stopping
+            Task { [weak self] in
+                guard let self else { return }
+                if await self.confirmNormalSleepAfterBatteryStop() {
+                    self.error = nil
+                    self.status = .off
+                } else {
+                    let detail = "Mac Coffee could not confirm that normal sleep behavior was restored after unplugging. Check lid support status."
+                    self.error = detail
+                    self.status = .error(detail)
+                }
+            }
+        } else {
+            stopOnBatteryForSession = false
+            error = message
+            status = .error(message)
+        }
+    }
+
+    private func confirmNormalSleepAfterBatteryStop(timeout: TimeInterval = 15) async -> Bool {
+        let finishBy = Date().addingTimeInterval(timeout)
+        while Date() < finishBy {
+            let snapshot = await readOnlyDiagnostic()
+            if snapshot.setupStatus == .enabled,
+               snapshot.observedSessionActive == false,
+               helperConfirmsNormalSleep(snapshot.detail) {
+                return true
+            }
+            do { try await Task.sleep(nanoseconds: 250_000_000) }
+            catch { return false }
+        }
+        return false
     }
 
     private func closeSessionConnection(_ connection: NSXPCConnection) {
@@ -736,6 +821,8 @@ final class LidAwakeController: ObservableObject {
         ownsSession = false
         isEnabled = false
         isStopRequestInProgress = false
+        isWaitingForLidClose = false
+        stopOnBatteryForSession = false
         deadline = nil
         remaining = nil
         heartbeatTask?.cancel()

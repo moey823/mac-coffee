@@ -75,9 +75,16 @@ private final class LidAwakeXPCSession: NSObject, LidAwakeXPCProtocol {
         reply(status.isActive, status.deadlineEpoch.map(NSNumber.init(value:)), status.detail)
     }
 
-    func startSession(durationSeconds: NSNumber?, reply: @escaping (Bool, NSNumber?, String?) -> Void) {
+    func startSession(
+        durationSeconds: NSNumber?,
+        startOnLidClose: Bool,
+        stopOnBattery: Bool,
+        reply: @escaping (Bool, NSNumber?, String?) -> Void
+    ) {
         let result = coordinator.startSession(
             durationSeconds: durationSeconds?.doubleValue,
+            startOnLidClose: startOnLidClose,
+            stopOnBattery: stopOnBattery,
             ownerConnectionIdentifier: connectionIdentifier,
             auditSessionIdentifier: auditSessionIdentifier,
             ownerUserIdentifier: ownerUserIdentifier,

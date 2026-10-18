@@ -1,27 +1,53 @@
 import Foundation
 
-public enum LidAwakeDuration: Int, CaseIterable, Identifiable, Sendable {
-    case minutes1 = 60
-    case minutes15 = 900
-    case minutes30 = 1800
-    case minutes60 = 3600
-    case minutes120 = 7200
-    case unlimited = 0
+/// Timer values are stored in seconds to keep existing preferences and helper callers stable.
+public struct LidAwakeDuration: RawRepresentable, CaseIterable, Identifiable, Hashable, Sendable {
+    public let rawValue: Int
+
+    public init?(rawValue: Int) {
+        guard rawValue == 0 || (rawValue >= 60 && rawValue <= 24 * 60 * 60 && rawValue.isMultiple(of: 60)) else {
+            return nil
+        }
+        self.rawValue = rawValue
+    }
+
+    /// Makes a timer duration from whole minutes. Zero means Until stopped.
+    public init?(minutes: Int) {
+        guard (0...24 * 60).contains(minutes) else { return nil }
+        self.init(rawValue: minutes * 60)
+    }
+
+    public static let minutes1 = Self(rawValue: 60)!
+    public static let minutes15 = Self(rawValue: 900)!
+    public static let minutes30 = Self(rawValue: 1_800)!
+    public static let minutes60 = Self(rawValue: 3_600)!
+    public static let minutes120 = Self(rawValue: 7_200)!
+    public static let unlimited = Self(rawValue: 0)!
+
+    /// The original presets remain the available quick choices. Custom minutes use init(minutes:).
+    public static let allCases: [Self] = [
+        .minutes1, .minutes15, .minutes30, .minutes60, .minutes120, .unlimited
+    ]
 
     public var id: Int { rawValue }
 
     public var seconds: TimeInterval? {
-        self == .unlimited ? nil : TimeInterval(rawValue)
+        rawValue == 0 ? nil : TimeInterval(rawValue)
+    }
+
+    public var minutes: Int? {
+        rawValue == 0 ? nil : rawValue / 60
     }
 
     public var title: String {
-        switch self {
-        case .minutes1: "1 minute"
-        case .minutes15: "15 minutes"
-        case .minutes30: "30 minutes"
-        case .minutes60: "60 minutes"
-        case .minutes120: "120 minutes"
-        case .unlimited: "Until stopped"
+        switch rawValue {
+        case 60: "1 minute"
+        case 900: "15 minutes"
+        case 1_800: "30 minutes"
+        case 3_600: "60 minutes"
+        case 7_200: "120 minutes"
+        case 0: "Until stopped"
+        default: "\(rawValue / 60) minutes"
         }
     }
 }
@@ -37,8 +63,8 @@ public struct LidAwakeSessionRecord: Codable, Equatable, Sendable {
     public let durationSeconds: TimeInterval?
     public let startedEpoch: TimeInterval
     public let startedMonotonic: TimeInterval
-    public let deadlineEpoch: TimeInterval?
-    public let deadlineMonotonic: TimeInterval?
+    public var deadlineEpoch: TimeInterval?
+    public var deadlineMonotonic: TimeInterval?
     public var lastHeartbeatEpoch: TimeInterval
     public var lastHeartbeatMonotonic: TimeInterval
     public let bootIdentifier: String
@@ -46,9 +72,23 @@ public struct LidAwakeSessionRecord: Codable, Equatable, Sendable {
     public let ownerUserIdentifier: UInt32
     public let ownerConnectionIdentifier: String
     public let applicationCodeHash: String
+    /// Optional for backwards-compatible decoding of journals written before lid-close timers.
+    public var startOnLidClose: Bool?
+    /// Optional for backwards-compatible decoding of journals written before unplug stopping.
+    public var stopOnBattery: Bool?
+    /// False while waiting; set once when the first confirmed lid-close starts the timer.
+    public var lidCloseTriggered: Bool?
     public var phase: LidAwakeSessionPhase
     public var sleepNowOnRestore: Bool
     public var sleepNowIssued: Bool
+
+    public var isWaitingForLidClose: Bool {
+        startOnLidClose == true && durationSeconds != nil && lidCloseTriggered != true
+    }
+
+    public var shouldStopOnBattery: Bool {
+        stopOnBattery == true
+    }
 
     public init(
         sessionID: String = UUID().uuidString,
@@ -62,14 +102,19 @@ public struct LidAwakeSessionRecord: Codable, Equatable, Sendable {
         applicationCodeHash: String,
         phase: LidAwakeSessionPhase = .applying,
         sleepNowOnRestore: Bool = false,
-        sleepNowIssued: Bool = false
+        sleepNowIssued: Bool = false,
+        startOnLidClose: Bool = false,
+        stopOnBattery: Bool = false,
+        lidIsClosed: Bool? = true
     ) {
+        let startsTimerOnLidClose = startOnLidClose && durationSeconds != nil
+        let waitingForLidClose = startsTimerOnLidClose && lidIsClosed != true
         self.sessionID = sessionID
         self.durationSeconds = durationSeconds
         self.startedEpoch = startedEpoch
         self.startedMonotonic = startedMonotonic
-        self.deadlineEpoch = durationSeconds.map { startedEpoch + $0 }
-        self.deadlineMonotonic = durationSeconds.map { startedMonotonic + $0 }
+        self.deadlineEpoch = waitingForLidClose ? nil : durationSeconds.map { startedEpoch + $0 }
+        self.deadlineMonotonic = waitingForLidClose ? nil : durationSeconds.map { startedMonotonic + $0 }
         self.lastHeartbeatEpoch = startedEpoch
         self.lastHeartbeatMonotonic = startedMonotonic
         self.bootIdentifier = bootIdentifier
@@ -77,6 +122,9 @@ public struct LidAwakeSessionRecord: Codable, Equatable, Sendable {
         self.ownerUserIdentifier = ownerUserIdentifier
         self.ownerConnectionIdentifier = ownerConnectionIdentifier
         self.applicationCodeHash = applicationCodeHash
+        self.startOnLidClose = startsTimerOnLidClose
+        self.stopOnBattery = stopOnBattery
+        self.lidCloseTriggered = !waitingForLidClose
         self.phase = phase
         self.sleepNowOnRestore = sleepNowOnRestore
         self.sleepNowIssued = sleepNowIssued
@@ -90,6 +138,8 @@ public enum LidAwakeRestoreReason: String, Equatable, Sendable {
     case heartbeatExpired
     case lidStateUnknown
     case lowBattery
+    case unplugged
+    case powerSourceUnknown
     case criticalThermalState
     case helperRestart
     case rebooted
@@ -119,7 +169,10 @@ public enum LidAwakeSessionPolicy {
 
     public static func accepts(duration: TimeInterval?) -> Bool {
         guard let duration else { return true }
-        return duration.isFinite && duration >= minimumDuration && duration <= maximumDuration
+        return duration.isFinite
+            && duration >= minimumDuration
+            && duration <= maximumDuration
+            && duration.truncatingRemainder(dividingBy: 60) == 0
     }
 
     public static func startDecision(
@@ -145,6 +198,27 @@ public enum LidAwakeSessionPolicy {
         return elapsed >= 0 && wallElapsed >= 0 && elapsed < heartbeatTimeout && wallElapsed < heartbeatTimeout
     }
 
+    /// Starts the timer on the first confirmed lid close. Subsequent observations never move its deadline.
+    @discardableResult
+    public static func observeLidClose(
+        _ record: inout LidAwakeSessionRecord,
+        lidIsClosed: Bool?,
+        nowEpoch: TimeInterval,
+        nowMonotonic: TimeInterval
+    ) -> Bool {
+        guard record.phase == .active,
+              record.isWaitingForLidClose,
+              lidIsClosed == true,
+              let duration = record.durationSeconds,
+              accepts(duration: duration) else {
+            return false
+        }
+        record.lidCloseTriggered = true
+        record.deadlineEpoch = nowEpoch + duration
+        record.deadlineMonotonic = nowMonotonic + duration
+        return true
+    }
+
     public static func deadlineHasPassed(
         _ record: LidAwakeSessionRecord,
         nowEpoch: TimeInterval,
@@ -153,11 +227,30 @@ public enum LidAwakeSessionPolicy {
     ) -> Bool {
         guard let duration = record.durationSeconds else { return false }
         guard accepts(duration: duration) else { return true }
+        // An armed session has no countdown yet, regardless of how long it has been active.
+        guard !record.isWaitingForLidClose else { return false }
+
         if bootIdentifier == record.bootIdentifier {
-            let monotonicDeadline = record.deadlineMonotonic ?? (record.startedMonotonic + duration)
+            let monotonicDeadline: TimeInterval
+            if let savedDeadline = record.deadlineMonotonic {
+                monotonicDeadline = savedDeadline
+            } else if record.startOnLidClose == true {
+                // A triggered close timer without its persisted deadline is malformed; fail closed.
+                return true
+            } else {
+                monotonicDeadline = record.startedMonotonic + duration
+            }
             if nowMonotonic >= monotonicDeadline { return true }
         }
-        let wallDeadline = record.deadlineEpoch ?? (record.startedEpoch + duration)
+
+        let wallDeadline: TimeInterval
+        if let savedDeadline = record.deadlineEpoch {
+            wallDeadline = savedDeadline
+        } else if record.startOnLidClose == true {
+            return true
+        } else {
+            wallDeadline = record.startedEpoch + duration
+        }
         return nowEpoch >= wallDeadline
     }
 
@@ -200,7 +293,8 @@ public enum LidAwakeSessionPolicy {
         auditSessionIdentifier: UInt32?,
         isOnBattery: Bool?,
         batteryPercent: Double?,
-        criticalThermalState: Bool
+        criticalThermalState: Bool,
+        lidIsClosed: Bool? = nil
     ) -> LidAwakeRecoveryAction {
         guard let sleepDisabled else { return .waitForReadableSleepPolicy }
 
@@ -230,8 +324,19 @@ public enum LidAwakeSessionPolicy {
         if criticalThermalState {
             return .restore(reason: .criticalThermalState, sleepNowIfLidClosed: true)
         }
+        if record.shouldStopOnBattery {
+            guard let isOnBattery else {
+                return .restore(reason: .powerSourceUnknown, sleepNowIfLidClosed: true)
+            }
+            if isOnBattery {
+                return .restore(reason: .unplugged, sleepNowIfLidClosed: true)
+            }
+        }
         if isOnBattery == true, let batteryPercent, batteryPercent <= 15 {
             return .restore(reason: .lowBattery, sleepNowIfLidClosed: true)
+        }
+        if record.isWaitingForLidClose, lidIsClosed == nil {
+            return .restore(reason: .lidStateUnknown, sleepNowIfLidClosed: false)
         }
         if deadlineHasPassed(record, nowEpoch: nowEpoch, nowMonotonic: nowMonotonic, bootIdentifier: bootIdentifier) {
             return .restore(reason: .durationExpired, sleepNowIfLidClosed: true)

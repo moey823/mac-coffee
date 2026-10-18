@@ -35,8 +35,22 @@ final class MacCoffeeCoreTests: XCTestCase {
             ["-i", "-d", "-t", "60", "-w", "1234"]
         )
         XCTAssertEqual(
+            CaffeinateCommand.arguments(
+                ownerPID: 73,
+                keepsDisplayOn: true,
+                timeoutSeconds: 420,
+                keepsDisksAwake: true,
+                preventsSystemSleepOnAC: true
+            ),
+            ["-i", "-d", "-m", "-s", "-t", "420", "-w", "73"]
+        )
+        XCTAssertEqual(
             CaffeinateCommand.arguments(ownerPID: 42, keepsDisplayOn: false, timeoutSeconds: nil),
             ["-i", "-w", "42"]
+        )
+        XCTAssertEqual(
+            CaffeinateCommand.wakeScreenPulseArguments(ownerPID: 42),
+            ["-u", "-t", "5", "-w", "42"]
         )
     }
 
@@ -273,6 +287,14 @@ final class MacCoffeeCoreTests: XCTestCase {
 
         XCTAssertTrue(LidAwakePolicyTransitions.ownsSession(record, connectionIdentifier: "gui-connection"))
         XCTAssertFalse(LidAwakePolicyTransitions.ownsSession(record, connectionIdentifier: "status-only-connection"))
+    }
+
+    func testWaitingLidTimerPresentationExplainsArmedState() {
+        let presentation = CoffeeMenuBarPresentation.make(for: .waitingForLidClose, keepsScreenOn: true)
+        XCTAssertEqual(presentation.symbolName, "cup.and.saucer.fill")
+        XCTAssertEqual(presentation.tint, .green)
+        XCTAssertTrue(presentation.accessibilityLabel.contains("timer starts when the lid closes"))
+        XCTAssertFalse(presentation.accessibilityLabel.contains("display"))
     }
 
     func testOffPresentationUsesRedOutlineWithoutClaimingSavedDisplayPreference() {
