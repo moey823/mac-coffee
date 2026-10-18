@@ -4,6 +4,10 @@ public enum CaffeinateCommand {
     /// -i prevents idle system sleep, -d prevents display sleep, -m prevents
     /// disk idle sleep, -s prevents system sleep only on AC power, -t bounds
     /// these assertions, and -w ties them to the owning app process.
+    public static func displayAssertionEnabled(savedPreference: Bool, temporaryDarkMode: Bool) -> Bool {
+        savedPreference || temporaryDarkMode
+    }
+
     public static func arguments(
         ownerPID: Int32,
         keepsDisplayOn: Bool,

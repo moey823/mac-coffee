@@ -2,7 +2,7 @@
 
 - Build and test on the Mac mini. Do not create MacBook development copies or build artifacts.
 - Keep this a native macOS menu bar app with `LSUIElement`; normal launch and diagnostics must start with no awake session.
-- Use the app-owned `/usr/bin/caffeinate` Process for awake assertions. The explicit `Keep awake, screen off now` action may invoke fixed `/usr/bin/pmset displaysleepnow` to sleep only the display; never invoke system `sleepnow` from the app. Keep fixed argument arrays and terminate only the Process instance Mac Coffee launched.
+- Use the app-owned /usr/bin/caffeinate Process for awake assertions. The explicit Keep awake, go dark action uses the private DisplayServices brightness API on the built-in display and keeps caffeinate -d active so the desktop remains available. If the API or display is unavailable, report failure and do not fall back to sleeping the display. Do not change lock, password, or screensaver settings or synthesize user input. Keep fixed argument arrays and terminate only Process instances Mac Coffee launched.
 - Keep a finite session deadline absolute across display preference changes. Caffeinate's `-t`, the app countdown, and the helper timer must use that same deadline.
 - Preserve the lid-awake helper's code identity checks, session ownership, journal recovery, heartbeat, battery and thermal safeguards, policy verification, and closed-lid expiry behavior.
 - Keep Mac Coffee's application, helper, launch daemon, mach service, and preferences identities unique to this app.

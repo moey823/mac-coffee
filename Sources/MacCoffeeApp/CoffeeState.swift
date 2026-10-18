@@ -31,6 +31,11 @@ enum CoffeeSessionStatus: Equatable {
     }
 }
 
+private enum CoffeeBrightnessRecoveryError: LocalizedError {
+    case missingRecord
+    var errorDescription: String? { "The saved display brightness recovery record is missing. Use a brightness key to restore the display." }
+}
+
 @MainActor
 final class CoffeeState: ObservableObject {
     @Published private(set) var isEnabled = false
@@ -42,14 +47,17 @@ final class CoffeeState: ObservableObject {
     @Published private(set) var isCustomTimerSelected: Bool
     @Published private(set) var customTimerMinutesText: String
     @Published private(set) var customTimerInputError: String?
-    @Published private(set) var isDisplaySleepActionInProgress = false
-    @Published private(set) var displaySleepError: String?
+    @Published private(set) var isDarkMode = false
+    @Published private(set) var isBrightnessActionInProgress = false
+    @Published private(set) var displayBrightnessError: String?
     @Published var keepsScreenOn: Bool {
         didSet {
             guard keepsScreenOn != oldValue else { return }
             defaults.set(keepsScreenOn, forKey: Self.keepsScreenOnKey)
             guard isEnabled else { return }
-            restartCaffeinatePreservingDeadline()
+            if let error = restartCaffeinatePreservingDeadline() {
+                Task { await failSession(error) }
+            }
         }
     }
 
@@ -63,10 +71,8 @@ final class CoffeeState: ObservableObject {
     private let defaults: UserDefaults
     private var caffeinateProcess: Process?
     private var wakeScreenProcess: Process?
-    private var displaySleepProcess: Process?
-    private var displaySleepRequestID: UUID?
-    private var displaySleepContinuation: CheckedContinuation<String?, Never>?
     private var sessionTask: Task<Void, Never>?
+    private var brightnessRecoveryTask: Task<Void, Never>?
     private var operationID: UUID?
     private var sessionStartsTimerOnLidClose = false
     private var sessionStopsOnBattery = false
@@ -75,6 +81,7 @@ final class CoffeeState: ObservableObject {
     private var timerNotificationSent = false
     private var sessionNotifyOnTimerEnd = false
     private var lastPowerSource: CoffeePowerSource = .unknown
+    private var brightnessController: DisplayBrightnessController { MacCoffeeDisplayBrightness.shared.controller }
 
     init(
         isPreview: Bool = false,
@@ -101,12 +108,13 @@ final class CoffeeState: ObservableObject {
         if lidStateAvailable {
             Task { await lidAwakeController.refreshStatusAndWait() }
         }
+        Task { await recoverBrightnessFromPreviousLaunch() }
     }
 
     func setEnabled(_ enabled: Bool) {
         guard !isPreview, !isBusy, enabled != isEnabled else { return }
         if enabled {
-            guard !isDisplaySleepActionInProgress else { return }
+            guard !isBrightnessActionInProgress else { return }
             if isCustomTimerSelected, customTimerInputError != nil {
                 sessionStatus = .error(customTimerInputError ?? "Enter a valid timer from 1 to 1,440 minutes.")
                 return
@@ -118,43 +126,155 @@ final class CoffeeState: ObservableObject {
     }
 
     func setKeepsScreenOn(_ enabled: Bool) {
-        guard keepsScreenOn != enabled, !isDisplaySleepActionInProgress else { return }
+        guard keepsScreenOn != enabled, !isBrightnessActionInProgress else { return }
         keepsScreenOn = enabled
     }
 
-    /// Starts or preserves the selected awake session, removes its display
-    /// assertion, then requests sleep for the display only.
+    /// Starts or continues the selected awake session, then dims the built-in
+    /// display while retaining a temporary display-awake assertion.
     @discardableResult
-    func keepAwakeScreenOffNow() async -> Bool {
-        guard !isPreview, !isBusy, !isDisplaySleepActionInProgress else { return false }
-        if !isEnabled, isCustomTimerSelected, customTimerInputError != nil {
+    func toggleDarkDisplay() async -> Bool {
+        guard !isPreview, !isBusy, !isBrightnessActionInProgress else { return false }
+        if isDarkMode { return await restoreDisplayBrightness() }
+        guard !isCustomTimerSelected || customTimerInputError == nil else {
             sessionStatus = .error(customTimerInputError ?? "Enter a valid timer from 1 to 1,440 minutes.")
             return false
         }
 
-        isDisplaySleepActionInProgress = true
-        displaySleepError = nil
-        defer { isDisplaySleepActionInProgress = false }
+        isBrightnessActionInProgress = true
+        displayBrightnessError = nil
+        defer { isBrightnessActionInProgress = false }
         stopOwnedWakeScreenPulse()
 
-        if isEnabled {
+        let sessionWasAlreadyOn = isEnabled
+        if sessionWasAlreadyOn {
             guard hasConfirmedAwakeSession else { return false }
-            if keepsScreenOn { keepsScreenOn = false }
-        } else {
-            guard await beginSession(wakeScreenOnExplicitStart: false, keepsScreenOnOverride: false) else {
+            isDarkMode = true
+            if !keepsScreenOn, let error = restartCaffeinatePreservingDeadline() {
+                isDarkMode = false
+                await failSession(error)
+                displayBrightnessError = error
                 return false
             }
+        } else {
+            guard await beginSession(
+                wakeScreenOnExplicitStart: false,
+                temporarilyKeepsDisplayOn: true
+            ) else { return false }
+            guard hasConfirmedAwakeSession else { return false }
+            isDarkMode = true
         }
 
         guard hasConfirmedAwakeSession,
               deadline.map({ $0 > Date() }) ?? true else {
+            isDarkMode = false
             return false
         }
 
-        let error = await requestDisplaySleep()
-        guard hasConfirmedAwakeSession else { return false }
-        displaySleepError = error
-        return error == nil
+        do {
+            try brightnessController.dim()
+            displayBrightnessError = nil
+            return true
+        } catch {
+            let dimError = error.localizedDescription
+            do {
+                let outcome = try brightnessController.restorePending()
+                switch outcome {
+                case .restored, .userOverride:
+                    isDarkMode = false
+                case .noRecord:
+                    isDarkMode = false
+                }
+                if isEnabled, let restartError = restartCaffeinatePreservingDeadline() {
+                    await failSession(restartError)
+                }
+                displayBrightnessError = dimError
+            } catch {
+                isDarkMode = (try? brightnessController.hasPendingRecord()) ?? true
+                displayBrightnessError = "\(dimError) \(error.localizedDescription)"
+            }
+            return false
+        }
+    }
+
+    private func restoreDisplayBrightness() async -> Bool {
+        isBrightnessActionInProgress = true
+        defer { isBrightnessActionInProgress = false }
+        do {
+            let outcome = try brightnessController.restorePending()
+            guard outcome != .noRecord else {
+                displayBrightnessError = "The saved brightness is unavailable. Use a brightness key to restore the display."
+                return false
+            }
+            isDarkMode = false
+            displayBrightnessError = nil
+            brightnessRecoveryTask?.cancel()
+            brightnessRecoveryTask = nil
+            if isEnabled, let error = restartCaffeinatePreservingDeadline() {
+                await failSession(error)
+                return false
+            }
+            return true
+        } catch {
+            isDarkMode = (try? brightnessController.hasPendingRecord()) ?? true
+            displayBrightnessError = error.localizedDescription
+            if !isEnabled { startBrightnessRecoveryRetry() }
+            return false
+        }
+    }
+
+    private func recoverBrightnessFromPreviousLaunch() async {
+        do {
+            let outcome = try brightnessController.restorePending()
+            if outcome == .noRecord {
+                isDarkMode = false
+            } else {
+                isDarkMode = false
+                displayBrightnessError = nil
+            }
+        } catch {
+            isDarkMode = (try? brightnessController.hasPendingRecord()) ?? true
+            displayBrightnessError = error.localizedDescription
+            startBrightnessRecoveryRetry()
+        }
+    }
+
+    private func startBrightnessRecoveryRetry() {
+        guard brightnessRecoveryTask == nil else { return }
+        brightnessRecoveryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if !self.isEnabled {
+                    do {
+                        _ = try self.brightnessController.restorePending()
+                        self.isDarkMode = false
+                        self.displayBrightnessError = nil
+                        self.brightnessRecoveryTask = nil
+                        return
+                    } catch {
+                        self.displayBrightnessError = error.localizedDescription
+                        self.isDarkMode = (try? self.brightnessController.hasPendingRecord()) ?? true
+                    }
+                }
+                do { try await Task.sleep(nanoseconds: 3_000_000_000) }
+                catch { return }
+            }
+        }
+    }
+
+    private func restoreBrightnessBeforeEndingSession() {
+        guard isDarkMode else { return }
+        do {
+            let outcome = try brightnessController.restorePending()
+            guard outcome != .noRecord else {
+                throw CoffeeBrightnessRecoveryError.missingRecord
+            }
+            isDarkMode = false
+            displayBrightnessError = nil
+        } catch {
+            isDarkMode = true
+            displayBrightnessError = error.localizedDescription
+        }
     }
 
     private var hasConfirmedAwakeSession: Bool {
@@ -226,9 +346,21 @@ final class CoffeeState: ObservableObject {
     func applicationWillTerminate() {
         sessionTask?.cancel()
         sessionTask = nil
+        brightnessRecoveryTask?.cancel()
+        brightnessRecoveryTask = nil
+        if isDarkMode {
+            do {
+                let outcome = try brightnessController.restorePending()
+                if outcome == .noRecord {
+                    fputs("Mac Coffee: no saved brightness recovery record was available at quit.\n", stderr)
+                } else {
+                    isDarkMode = false
+                }
+            } catch {
+                fputs("Mac Coffee: display brightness remains pending restoration: \(error.localizedDescription)\n", stderr)
+            }
+        }
         isEnabled = false
-        cancelDisplaySleepRequest()
-        displaySleepError = nil
         stopOwnedCaffeinate()
         stopOwnedWakeScreenPulse()
         if !isPreview { lidAwakeController.stopForApplicationShutdown() }
@@ -236,11 +368,10 @@ final class CoffeeState: ObservableObject {
 
     private func beginSession(
         wakeScreenOnExplicitStart: Bool = true,
-        keepsScreenOnOverride: Bool? = nil
+        temporarilyKeepsDisplayOn: Bool = false
     ) async -> Bool {
         guard !isPreview, !isBusy, !isEnabled else { return false }
         isBusy = true
-        displaySleepError = nil
         sessionStatus = .starting
         let requestedID = UUID()
         operationID = requestedID
@@ -306,7 +437,7 @@ final class CoffeeState: ObservableObject {
         if let launchError = launchCaffeinate(
             until: deadline,
             wakeScreenOnExplicitStart: wakeScreenOnExplicitStart,
-            keepsDisplayOn: keepsScreenOnOverride ?? keepsScreenOn
+            temporarilyKeepsDisplayOn: temporarilyKeepsDisplayOn
         ) {
             if helperStarted { _ = await lidAwakeController.stopAndWait() }
             deadline = nil
@@ -316,7 +447,6 @@ final class CoffeeState: ObservableObject {
             return false
         }
 
-        if let keepsScreenOnOverride { keepsScreenOn = keepsScreenOnOverride }
         isEnabled = true
         sessionStatus = .active
         updateWaitingForLidClose()
@@ -327,9 +457,8 @@ final class CoffeeState: ObservableObject {
 
     private func endSession() async {
         guard !isPreview, !isBusy else { return }
-        cancelDisplaySleepRequest()
-        displaySleepError = nil
         isBusy = true
+        restoreBrightnessBeforeEndingSession()
         operationID = UUID()
         sessionTask?.cancel()
         sessionTask = nil
@@ -359,12 +488,13 @@ final class CoffeeState: ObservableObject {
             sessionStatus = .error("Mac Coffee could not confirm that normal sleep behavior was restored. Check lid support status.")
         }
         clearSessionOptions()
+        if isDarkMode { startBrightnessRecoveryRetry() }
     }
 
     private func launchCaffeinate(
         until deadline: Date?,
         wakeScreenOnExplicitStart: Bool,
-        keepsDisplayOn: Bool? = nil
+        temporarilyKeepsDisplayOn: Bool = false
     ) -> String? {
         if let deadline, deadline <= Date() {
             return "The timer expired before the awake assertion could start. Choose a new timer and try again."
@@ -374,7 +504,10 @@ final class CoffeeState: ObservableObject {
         let timeout = deadline.map { AwakeDeadline.timeoutSeconds(until: $0) }
         task.arguments = CaffeinateCommand.arguments(
             ownerPID: ProcessInfo.processInfo.processIdentifier,
-            keepsDisplayOn: keepsDisplayOn ?? keepsScreenOn,
+            keepsDisplayOn: CaffeinateCommand.displayAssertionEnabled(
+                savedPreference: keepsScreenOn,
+                temporaryDarkMode: isDarkMode || temporarilyKeepsDisplayOn
+            ),
             timeoutSeconds: timeout,
             keepsDisksAwake: sessionKeepsDisksAwake,
             preventsSystemSleepOnAC: sessionPreventsSystemSleepOnAC
@@ -422,81 +555,19 @@ final class CoffeeState: ObservableObject {
         }
     }
 
-    private func restartCaffeinatePreservingDeadline() {
-        guard isEnabled else { return }
+    @discardableResult
+    private func restartCaffeinatePreservingDeadline() -> String? {
+        guard isEnabled else { return nil }
         if let deadline, deadline <= Date() {
             Task { await expireSession() }
-            return
+            return nil
         }
         stopOwnedCaffeinate()
-        if let error = launchCaffeinate(until: deadline, wakeScreenOnExplicitStart: false) {
-            Task { await failSession(error) }
-        }
-    }
-
-    private func requestDisplaySleep() async -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: DisplaySleepCommand.executablePath)
-        process.arguments = DisplaySleepCommand.arguments
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-
-        let requestID = UUID()
-        return await withCheckedContinuation { continuation in
-            displaySleepRequestID = requestID
-            displaySleepContinuation = continuation
-            process.terminationHandler = { [weak self] terminated in
-                let status = terminated.terminationStatus
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    let error = status == 0
-                        ? nil
-                        : "The display could not be turned off (pmset exited with status \(status)). Your awake session is still on."
-                    self.finishDisplaySleepRequest(requestID, error: error)
-                }
-            }
-            do {
-                try process.run()
-                displaySleepProcess = process
-                Task { @MainActor [weak self] in
-                    do { try await Task.sleep(nanoseconds: 5_000_000_000) }
-                    catch { return }
-                    self?.finishDisplaySleepRequest(
-                        requestID,
-                        error: "The display sleep request timed out. Your awake session is still on.",
-                        terminateProcess: true
-                    )
-                }
-            } catch {
-                finishDisplaySleepRequest(
-                    requestID,
-                    error: "The display could not be turned off: \(error.localizedDescription). Your awake session is still on."
-                )
-            }
-        }
-    }
-
-    private func finishDisplaySleepRequest(
-        _ requestID: UUID,
-        error: String?,
-        terminateProcess: Bool = false
-    ) {
-        guard displaySleepRequestID == requestID else { return }
-        displaySleepRequestID = nil
-        let process = displaySleepProcess
-        displaySleepProcess = nil
-        if terminateProcess, let process, process.isRunning {
-            process.terminate()
-        }
-        let continuation = displaySleepContinuation
-        displaySleepContinuation = nil
-        continuation?.resume(returning: error)
-    }
-
-    private func cancelDisplaySleepRequest() {
-        guard let requestID = displaySleepRequestID else { return }
-        finishDisplaySleepRequest(requestID, error: nil, terminateProcess: true)
+        return launchCaffeinate(
+            until: deadline,
+            wakeScreenOnExplicitStart: false,
+            temporarilyKeepsDisplayOn: isDarkMode
+        )
     }
 
     private func stopOwnedCaffeinate() {
@@ -537,6 +608,21 @@ final class CoffeeState: ObservableObject {
             while !Task.isCancelled && self.isEnabled {
                 self.synchronizeHelperDeadline()
                 self.updateRemaining()
+                if self.isDarkMode {
+                    do {
+                        if try self.brightnessController.userRaisedBrightness() {
+                            self.isDarkMode = false
+                            self.displayBrightnessError = nil
+                            if let error = self.restartCaffeinatePreservingDeadline() {
+                                self.sessionTask = nil
+                                await self.failSession(error)
+                                return
+                            }
+                        }
+                    } catch {
+                        self.displayBrightnessError = error.localizedDescription
+                    }
+                }
                 if let deadline = self.deadline, deadline <= Date() {
                     self.sessionTask = nil
                     await self.expireSession()
@@ -554,7 +640,11 @@ final class CoffeeState: ObservableObject {
                     self.lastPowerSource = currentPower
                     if self.sessionPreventsSystemSleepOnAC,
                        previousPower == .ac || currentPower == .ac {
-                        self.restartCaffeinatePreservingDeadline()
+                        if let error = self.restartCaffeinatePreservingDeadline() {
+                            self.sessionTask = nil
+                            await self.failSession(error)
+                            return
+                        }
                     }
                 }
 
@@ -593,7 +683,9 @@ final class CoffeeState: ObservableObject {
         deadline = helperDeadline
         updateWaitingForLidClose()
         updateRemaining()
-        restartCaffeinatePreservingDeadline()
+        if let error = restartCaffeinatePreservingDeadline() {
+            Task { await failSession(error) }
+        }
     }
 
     private func updateWaitingForLidClose() {
@@ -612,8 +704,7 @@ final class CoffeeState: ObservableObject {
     /// the app stops caffeinate and lets the helper finish its own recovery.
     private func expireSession() async {
         guard isEnabled else { return }
-        cancelDisplaySleepRequest()
-        displaySleepError = nil
+        restoreBrightnessBeforeEndingSession()
         if sessionStopsOnBattery && CoffeePowerSource.current() == .battery {
             await endSession()
             return
@@ -638,6 +729,7 @@ final class CoffeeState: ObservableObject {
                     isBusy = false
                     sessionStatus = .off
                     clearSessionOptions()
+                    if isDarkMode { startBrightnessRecoveryRetry() }
                     await notifyTimerFinishedIfNeeded(shouldNotify)
                     return
                 case .error(let detail), .unavailable(let detail):
@@ -646,6 +738,7 @@ final class CoffeeState: ObservableObject {
                     isBusy = false
                     sessionStatus = .error("The timer expired, but the helper reported a restore problem: \(detail)")
                     clearSessionOptions()
+                    if isDarkMode { startBrightnessRecoveryRetry() }
                     return
                 case .starting, .active, .stopping:
                     break
@@ -658,6 +751,7 @@ final class CoffeeState: ObservableObject {
             isBusy = false
             sessionStatus = .error("The timer expired, but Mac Coffee did not receive confirmation that normal sleep behavior was restored. Check lid support status.")
             clearSessionOptions()
+            if isDarkMode { startBrightnessRecoveryRetry() }
             return
         }
 
@@ -666,6 +760,7 @@ final class CoffeeState: ObservableObject {
         isBusy = false
         sessionStatus = .off
         clearSessionOptions()
+        if isDarkMode { startBrightnessRecoveryRetry() }
         await notifyTimerFinishedIfNeeded(shouldNotify)
     }
 
@@ -679,8 +774,7 @@ final class CoffeeState: ObservableObject {
 
     private func failSession(_ message: String) async {
         guard isEnabled else { return }
-        cancelDisplaySleepRequest()
-        displaySleepError = nil
+        restoreBrightnessBeforeEndingSession()
         operationID = UUID()
         sessionTask?.cancel()
         sessionTask = nil
@@ -700,6 +794,7 @@ final class CoffeeState: ObservableObject {
         isBusy = false
         sessionStatus = .error(message)
         clearSessionOptions()
+        if isDarkMode { startBrightnessRecoveryRetry() }
     }
 
     private func clearSessionOptions() {

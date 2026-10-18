@@ -19,8 +19,7 @@ enum MacCoffeeMain {
             exit(await repairLidHelper())
         }
         if arguments.contains("--show") {
-            // Opening the normal menu bar app presents the popover on user click.
-            // Keep this switch harmless for launcher workflows and diagnostics.
+            // Open the normal menu bar app with its popover visible for review.
         }
 
         let app = NSApplication.shared
@@ -45,6 +44,10 @@ enum MacCoffeeMain {
         } else {
             print("Helper session active: unknown")
         }
+        let display = MacCoffeeDisplayBrightness.shared.diagnostic()
+        print("Built-in display brightness support: \(display.support)")
+        print("Built-in display brightness: \(display.builtInBrightness)")
+        print("Pending brightness recovery: \(display.pendingRecovery)")
         return 0
     }
 

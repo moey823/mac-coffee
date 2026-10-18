@@ -218,23 +218,29 @@ struct MacCoffeeMenuView: View {
                     .labelsHidden().toggleStyle(.switch).controlSize(.small)
                     .accessibilityLabel("Keep screen on")
                     .help("Keep the display awake only during an active session.")
-                    .disabled(state.isBusy || state.isDisplaySleepActionInProgress)
+                    .disabled(state.isBusy || state.isBrightnessActionInProgress)
             }
             Button {
-                Task { _ = await state.keepAwakeScreenOffNow() }
+                Task { _ = await state.toggleDarkDisplay() }
             } label: {
-                Label("Keep awake, screen off now", systemImage: "moon.zzz")
+                Label(state.isDarkMode ? "Restore display" : "Keep awake, go dark",
+                      systemImage: state.isDarkMode ? "sun.max" : "moon.zzz")
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.bordered)
-            .help("Start or continue the selected awake session, then turn off only the display.")
+            .help(state.isDarkMode
+                  ? "Restore the built-in display brightness captured before dark mode."
+                  : "Keep the desktop available while dimming the built-in display.")
             .disabled(state.isBusy
-                      || state.isDisplaySleepActionInProgress
-                      || (!state.isEnabled && state.isCustomTimerSelected && state.customTimerInputError != nil))
-            if let error = state.displaySleepError {
+                      || state.isBrightnessActionInProgress
+                      || (!state.isDarkMode && state.isCustomTimerSelected && state.customTimerInputError != nil))
+            Text("Desktop stays available. Use a brightness key to bring it back.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let error = state.displayBrightnessError {
                 Text(error).font(.caption).foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityLabel("Display sleep error: \(error)")
+                    .accessibilityLabel("Display brightness error: \(error)")
             }
             Divider()
             HStack {
@@ -415,7 +421,9 @@ struct MacCoffeeMenuView: View {
         if state.isWaitingForLidClose { return "Timer starts when the lid closes." }
         return switch state.sessionStatus {
         case .active:
-            state.remaining == nil ? "Awake until stopped." : "Normal sleep resumes when the timer ends."
+            state.isDarkMode
+                ? "The display is dimmed; the desktop stays available."
+                : (state.remaining == nil ? "Awake until stopped." : "Normal sleep resumes when the timer ends.")
         default:
             state.sessionStatus.detail
         }

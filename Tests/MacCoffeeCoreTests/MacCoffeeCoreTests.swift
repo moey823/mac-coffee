@@ -54,11 +54,149 @@ final class MacCoffeeCoreTests: XCTestCase {
         )
     }
 
-    func testDisplaySleepCommandTargetsOnlyTheDisplayWithFixedArguments() {
-        XCTAssertEqual(DisplaySleepCommand.executablePath, "/usr/bin/pmset")
-        XCTAssertEqual(DisplaySleepCommand.arguments, ["displaysleepnow"])
-        XCTAssertFalse(DisplaySleepCommand.arguments.contains("sleepnow"))
-        XCTAssertFalse(DisplaySleepCommand.arguments.contains("disablesleep"))
+    func testTemporaryDarkModeKeepsDisplayAssertionWithoutChangingSavedPreference() {
+        XCTAssertTrue(CaffeinateCommand.displayAssertionEnabled(savedPreference: false, temporaryDarkMode: true))
+        XCTAssertTrue(CaffeinateCommand.displayAssertionEnabled(savedPreference: true, temporaryDarkMode: true))
+        XCTAssertFalse(CaffeinateCommand.displayAssertionEnabled(savedPreference: false, temporaryDarkMode: false))
+
+        XCTAssertEqual(
+            CaffeinateCommand.arguments(
+                ownerPID: 42,
+                keepsDisplayOn: CaffeinateCommand.displayAssertionEnabled(
+                    savedPreference: false,
+                    temporaryDarkMode: true
+                ),
+                timeoutSeconds: 60
+            ),
+            ["-i", "-d", "-t", "60", "-w", "42"]
+        )
+    }
+
+    func testBrightnessControllerPersistsBeforeDimAndRestoresCapturedLevel() throws {
+        var brightness: Float = 0.72
+        var record: DisplayBrightnessRecoveryRecord?
+        var writes: [Float] = []
+        let controller = makeBrightnessController(
+            brightness: { brightness },
+            record: { record },
+            saveRecord: { record = $0 },
+            setBrightness: { uuid, value in
+                XCTAssertEqual(uuid, "built-in-A")
+                XCTAssertNotNil(record, "The recovery record must exist before the display is dimmed.")
+                brightness = value
+                writes.append(value)
+            }
+        )
+
+        try controller.dim()
+        XCTAssertEqual(brightness, 0)
+        XCTAssertEqual(record?.originalBrightness, 0.72)
+        XCTAssertEqual(writes, [0])
+
+        XCTAssertEqual(try controller.restorePending(), .restored)
+        XCTAssertEqual(brightness, 0.72)
+        XCTAssertNil(record)
+        XCTAssertEqual(writes, [0, 0.72])
+    }
+
+    func testBrightnessControllerDoesNotOverwriteManualBrightnessIncrease() throws {
+        var brightness: Float = 0.8
+        var record: DisplayBrightnessRecoveryRecord? = .init(displayUUID: "built-in-A", originalBrightness: 0.55)
+        var writes: [Float] = []
+        let controller = makeBrightnessController(
+            brightness: { brightness },
+            record: { record },
+            saveRecord: { record = $0 },
+            setBrightness: { _, value in writes.append(value); brightness = value }
+        )
+
+        XCTAssertEqual(try controller.restorePending(), .userOverride)
+        XCTAssertEqual(brightness, 0.8)
+        XCTAssertTrue(writes.isEmpty)
+        XCTAssertNil(record)
+    }
+
+    func testBrightnessControllerReportsFailureToClearManualOverrideRecord() {
+        var brightness: Float = 0.5
+        let record = DisplayBrightnessRecoveryRecord(displayUUID: "built-in-A", originalBrightness: 0.7)
+        let controller = DisplayBrightnessController(
+            readCurrent: { DisplayBrightnessSnapshot(displayUUID: "built-in-A", brightness: brightness) },
+            setBrightness: { _, _ in XCTFail("Manual brightness must never be overwritten.") },
+            loadRecord: { record },
+            saveRecord: { _ in throw FakeBrightnessError.writeFailed }
+        )
+
+        XCTAssertThrowsError(try controller.restorePending())
+        XCTAssertEqual(brightness, 0.5)
+    }
+
+    func testBrightnessControllerRetainsRecoveryRecordWhenDimmingOrRestoreFails() throws {
+        var brightness: Float = 0.6
+        var record: DisplayBrightnessRecoveryRecord?
+        let dimFailure = makeBrightnessController(
+            brightness: { brightness },
+            record: { record },
+            saveRecord: { record = $0 },
+            setBrightness: { _, _ in throw FakeBrightnessError.writeFailed }
+        )
+        XCTAssertThrowsError(try dimFailure.dim())
+        XCTAssertEqual(record?.originalBrightness, 0.6)
+        XCTAssertEqual(brightness, 0.6)
+
+        brightness = 0
+        let restoreFailure = makeBrightnessController(
+            brightness: { brightness },
+            record: { record },
+            saveRecord: { record = $0 },
+            setBrightness: { _, _ in throw FakeBrightnessError.writeFailed }
+        )
+        XCTAssertThrowsError(try restoreFailure.restorePending())
+        XCTAssertNotNil(record)
+        XCTAssertEqual(brightness, 0)
+    }
+
+    func testBrightnessControllerKeepsRecordForUnavailableDisplayAndPreservesOriginalZero() throws {
+        var brightness: Float = 0.4
+        var uuid = "built-in-A"
+        var record: DisplayBrightnessRecoveryRecord?
+        let controller = makeBrightnessController(
+            brightness: { brightness },
+            displayUUID: { uuid },
+            record: { record },
+            saveRecord: { record = $0 },
+            setBrightness: { _, value in brightness = value }
+        )
+
+        try controller.dim()
+        uuid = "built-in-B"
+        XCTAssertThrowsError(try controller.restorePending())
+        XCTAssertNotNil(record)
+
+        uuid = "built-in-A"
+        brightness = 0
+        record = .init(displayUUID: "built-in-A", originalBrightness: 0)
+        XCTAssertEqual(try controller.restorePending(), .restored)
+        XCTAssertEqual(brightness, 0)
+        XCTAssertNil(record)
+    }
+
+    private func makeBrightnessController(
+        brightness: @escaping () -> Float,
+        displayUUID: @escaping () -> String = { "built-in-A" },
+        record: @escaping () -> DisplayBrightnessRecoveryRecord?,
+        saveRecord: @escaping (DisplayBrightnessRecoveryRecord?) -> Void,
+        setBrightness: @escaping (String, Float) throws -> Void
+    ) -> DisplayBrightnessController {
+        DisplayBrightnessController(
+            readCurrent: { DisplayBrightnessSnapshot(displayUUID: displayUUID(), brightness: brightness()) },
+            setBrightness: setBrightness,
+            loadRecord: record,
+            saveRecord: saveRecord
+        )
+    }
+
+    private enum FakeBrightnessError: Error {
+        case writeFailed
     }
 
     func testLidAwakeDurationAndOwnershipGuards() {
